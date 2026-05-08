@@ -43,6 +43,281 @@ TokoHebat adalah toko online kecil yang jual berbagai produk lokal. Backend diba
 
 ---
 
+## 🔴 Bug Kritis Tambahan
+
+### Bug #1 — Broken Access Control (Akses Admin Tanpa Login)
+
+**Deskripsi:** Di `routes/api.php`, route `/admin/dashboard` didaftarkan tanpa middleware apapun. Akibatnya siapapun bisa akses halaman admin langsung lewat URL, bahkan tanpa login. Di `app/Http/Controllers/Api/AdminController.php` juga tidak ada pengecekan role atau `authorize()` sama sekali.
+
+**File yang Bermasalah:**
+- 📄 [routes/api.php](routes/api.php) — Route tanpa middleware
+- 📄 [app/Http/Controllers/Api/AdminController.php](app/Http/Controllers/Api/AdminController.php) — Tidak ada authz check
+
+**❌ SEBELUM (Tidak Aman):**
+```php
+// routes/api.php — TIDAK ADA PERLINDUNGAN!
+Route::get('/admin/dashboard', function () {
+    return response()->json(['message' => 'Welcome admin']);
+});  // Siapapun bisa akses!
+```
+
+**✅ SESUDAH (Aman):**
+```php
+// routes/api.php — DENGAN MIDDLEWARE
+Route::middleware(['auth:sanctum', 'admin'])->group(function () {
+    Route::get('/admin/dashboard', [AdminController::class, 'dashboard']);
+});
+```
+
+**Dampak:**
+- 🔓 Siapapun bisa bypass login dan langsung akses dashboard
+- 📊 Bisa lihat data sensitif tanpa otorisasi
+- 🗑️ Bisa delete/edit data tanpa izin admin
+
+**Fix yang Diterapkan:**
+```php
+// app/Http/Middleware/AdminMiddleware.php
+class AdminMiddleware
+{
+    public function handle(Request $request, Closure $next): Response
+    {
+        if (!$request->user()) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
+        }
+
+        if ($request->user()->role !== 'admin') {
+            return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
+        }
+
+        return $next($request);
+    }
+}
+```
+
+---
+
+### Bug #2 — Authentication Bypass (Login Tanpa Password)
+
+**Deskripsi:** Di `app/Http/Controllers/Api/AuthController.php`, fungsi login hanya cari user by email, lalu langsung panggil `Auth::loginUsingId($user->id)` atau set user tanpa cek password sama sekali. Jadi siapapun yang tahu email orang lain bisa login ke akunnya tanpa perlu tahu passwordnya.
+
+**File yang Bermasalah:**
+- 📄 [app/Http/Controllers/Api/AuthController.php](app/Http/Controllers/Api/AuthController.php) — Logic login cacat
+- 📄 [app/Repositories/AuthRepository.php](app/Repositories/AuthRepository.php) — Repository login
+
+**❌ SEBELUM (Tidak Aman):**
+```php
+// ❌ CACAT: Tidak verifikasi password!
+public function login(LoginRequest $request)
+{
+    $user = User::where('email', $request->email)->first();  // Cari user
+    
+    if ($user) {
+        Auth::loginUsingId($user->id);  // LOGIN LANGSUNG TANPA CEK PASSWORD!
+        return response()->json(['token' => ..., 'user' => $user]);
+    }
+    
+    return response()->json(['message' => 'Invalid'], 401);
+}
+
+// Test Attack:
+// POST /api/login
+// { "email": "admin@gmail.com" }
+// ✅ BERHASIL LOGIN TANPA PASSWORD! 😱
+```
+
+**✅ SESUDAH (Aman):**
+```php
+// app/Repositories/AuthRepository.php
+public function login(array $credentials)
+{
+    $user = $this->findByEmail($credentials['email']);
+
+    // ✅ VERIFIKASI PASSWORD DENGAN HASH::CHECK()
+    if ($user && Hash::check($credentials['password'], $user->password)) {
+        $token = $user->createToken('auth_token')->plainTextToken;
+        return $token;
+    }
+
+    return null;  // ❌ LOGIN GAGAL jika password salah
+}
+```
+
+**Dampak:**
+- 🔓 Akses akun orang lain hanya dengan email
+- 💳 Bisa steal data pribadi, melakukan transaksi
+- 🚨 Bypass 2FA jika ada (karena langsung login tanpa verifikasi password)
+
+**Verifikasi Fix:**
+```bash
+# Test 1: Login dengan password benar
+curl -X POST http://localhost:8000/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@gmail.com", "password": "password"}' 
+# ✅ BERHASIL: {"status": "success", "data": "token_..."}
+
+# Test 2: Login dengan password salah
+curl -X POST http://localhost:8000/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@gmail.com", "password": "wrongpassword"}'
+# ❌ GAGAL: {"status": "error", "message": "Email atau password salah"}
+```
+
+---
+
+### Bug #3 — Plaintext Password Storage (Password Disimpan Teks Biasa)
+
+**Deskripsi:** Di `app/Http/Controllers/Api/UserController.php`, saat register password langsung disimpan dengan `'password' => $request->password`. Jadi yang masuk ke database adalah teks aslinya, misalnya `"rahasia123"`. Kalau database bocor, semua password langsung terbaca. Di `app/Models/User.php` juga password tidak dimasukkan ke `$hidden`, jadi ikut muncul kalau data user di-serialize ke JSON.
+
+**File yang Bermasalah:**
+- 📄 [app/Http/Controllers/Api/UserController.php](app/Http/Controllers/Api/UserController.php) — Register tanpa hash
+- 📄 [app/Models/User.php](app/Models/User.php) — Password di-serialize
+
+**❌ SEBELUM (Tidak Aman):**
+```php
+// app/Repositories/AuthRepository.php atau UserController
+public function register(array $data)
+{
+    // ❌ PASSWORD LANGSUNG DISIMPAN TANPA HASH!
+    $user = User::create([
+        'name' => $data['name'],
+        'email' => $data['email'],
+        'password' => $data['password'],  // "rahasia123" tersimpan apa adanya!
+    ]);
+    
+    return $user;
+}
+
+// Database table `users`:
+// id | name | email | password        | ...
+// 1  | John | j@... | rahasia123      | ...  ❌ TERBACA!
+// 2  | Jane | z@... | password456     | ...  ❌ TERBACA!
+```
+
+**User.php tanpa hidden password:**
+```php
+// ❌ SEBELUM: Password tidak di-hide
+class User extends Authenticatable
+{
+    // Password TIDAK di-hidden, ikut muncul di JSON!
+}
+
+// API Response:
+// GET /api/user
+// {
+//   "id": 1,
+//   "name": "John",
+//   "email": "j@example.com",
+//   "password": "rahasia123",  // ❌ PASSWORD TERBACA DI JSON!
+//   "created_at": "2026-05-08"
+// }
+```
+
+**✅ SESUDAH (Aman):**
+```php
+// app/Repositories/AuthRepository.php
+public function register(array $data)
+{
+    // ✅ PASSWORD DI-HASH DENGAN BCRYPT
+    $user = User::create([
+        'name' => $data['name'],
+        'email' => $data['email'],
+        'password' => Hash::make($data['password']),  // Hash::make() → bcrypt
+    ]);
+    
+    return $user;
+}
+
+// Database table `users`:
+// id | name | email | password                                 | ...
+// 1  | John | j@... | $2y$12$abc123def456...xyz  (64 char)    | ...  ✅ AMAN!
+// 2  | Jane | z@... | $2y$12$123abc456def...xyz  (64 char)    | ...  ✅ AMAN!
+```
+
+**User.php dengan hidden password:**
+```php
+// app/Models/User.php
+use Laravel\Sanctum\HasApiTokens;
+
+#[Fillable(['name', 'email', 'password', 'role'])]
+#[Hidden(['password', 'remember_token'])]  // ✅ PASSWORD HIDDEN!
+class User extends Authenticatable
+{
+    use HasApiTokens, HasFactory, Notifiable;
+
+    protected function casts(): array
+    {
+        return [
+            'email_verified_at' => 'datetime',
+            'password' => 'hashed',  // ✅ AUTO-HASH SAAT DI-SET!
+        ];
+    }
+}
+
+// API Response:
+// GET /api/user
+// {
+//   "id": 1,
+//   "name": "John",
+//   "email": "j@example.com",
+//   // ❌ PASSWORD TIDAK ADA DI JSON (di-hide)
+//   "created_at": "2026-05-08"
+// }
+```
+
+**Dampak:**
+- 🔓 Database bocor = semua password terbaca
+- 📧 Password bisa digunakan di akun lain (password reuse attack)
+- 🚨 API response expose password ke client
+- 💾 Password tersimpan di log, backup, cache
+
+**Attack Scenario:**
+```bash
+# Scenario 1: Database Dump
+# Hacker hack database dan download users table
+# Tabel berisi plaintext password → bisa langsung login semua akun
+
+# Scenario 2: API Intercept
+# Attacker intercept API response
+# Lihat password dalam JSON response → gunakan di akun lain
+
+# Scenario 3: Log Files
+# Admin baca log aplikasi
+# Lihat plaintext password di logging → data leak
+```
+
+**Verifikasi Fix:**
+```bash
+# Test 1: Cek password ter-hash di database
+mysql> SELECT id, email, password FROM users LIMIT 1;
++----+------------------+--------------------------------------------------------------+
+| id | email            | password                                                     |
++----+------------------+--------------------------------------------------------------+
+| 1  | admin@gmail.com  | $2y$12$abc123def456ghi789jkl012mnopqrs... (64 char hash)     |
++----+------------------+--------------------------------------------------------------+
+# ✅ HASH: Bukan plaintext!
+
+# Test 2: Cek password tidak muncul di API response
+curl http://localhost:8000/api/user \
+  -H "Authorization: Bearer token_xxx"
+# {
+#   "status": "success",
+#   "data": {
+#     "id": 1,
+#     "name": "Admin",
+#     "email": "admin@gmail.com",
+#     // ❌ TIDAK ADA PASSWORD KEY
+#   }
+# }
+# ✅ PASSWORD TIDAK TERLIHAT!
+
+# Test 3: Verifikasi Hash::check() saat login
+Hash::check('password', '$2y$12$abc123...') → true
+Hash::check('wrongpass', '$2y$12$abc123...') → false
+# ✅ BCRYPT VERIFY BERHASIL!
+```
+
+---
+
 ## ✅ Perbaikan yang Sudah Dilakukan
 
 ---
