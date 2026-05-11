@@ -71,6 +71,81 @@ $user = User::create([
 **Penjelasan untuk Presentasi/README:**
 Saya melakukan testing dengan register user menggunakan endpoint vulnerable. Setelah user berhasil register, saya membuka tabel users di database. Password ternyata tersimpan dalam bentuk plaintext dan bisa dibaca langsung tanpa decrypt. Hal ini termasuk vulnerability Sensitive Data Exposure atau Plaintext Password Storage.
 
+**Contoh Kode Salah dan Benar Sesuai File:**
+
+**❌ SALAH (Vulnerable) - app/Repositories/SalauthRepository.php:**
+```php
+// ❌ BUG: Password tersimpan plaintext
+public function register(array $data)
+{
+    return User::create([
+        'name' => $data['name'],
+        'email' => $data['email'],
+        // BUG: Langsung simpan tanpa hash!
+        'password' => $data['password'],
+        'role' => 'user'
+    ]);
+}
+
+// ❌ BUG: Login tanpa validasi password
+public function login(array $credentials)
+{
+    $user = User::where('email', $credentials['email'])->first();
+    
+    if (!$user) {
+        return null;
+    }
+    
+    // BUG: Password diabaikan, langsung return token!
+    return $user->createToken('auth_token')->plainTextToken;
+}
+```
+
+**✅ BENAR (Secure) - app/Repositories/AuthRepository.php:**
+```php
+// ✅ AMAN: Password di-hash dengan bcrypt
+public function register(array $data)
+{
+    $user = User::create([
+        'name' => $data['name'],
+        'email' => $data['email'],
+        // ✅ Hash password dengan Hash::make()
+        'password' => Hash::make($data['password']),
+    ]);
+
+    $token = $user->createToken('auth_token')->plainTextToken;
+    return $token;
+}
+
+// ✅ AMAN: Validasi email DAN password
+public function login(array $credentials)
+{
+    $user = $this->findByEmail($credentials['email']);
+
+    // ✅ Cek password dengan Hash::check()
+    if ($user && isset($credentials['password']) && Hash::check($credentials['password'], $user->password)) {
+        return $user->createToken('auth_token')->plainTextToken;
+    }
+
+    return null;
+}
+```
+
+**✅ BENAR (Secure) - database/seeders/AdminSeeder.php:**
+```php
+// ✅ AMAN: Password admin juga di-hash
+public function run(): void
+{
+    User::create([
+        'name' => 'Admin',
+        'email' => 'admin@gmail.com',
+        // ✅ Hash password admin
+        'password' => Hash::make('password'),
+        'role' => 'admin'
+    ]);
+}
+```
+
 ---
 
 ### 2. **User Bisa Login ke Akun Orang Lain** ❌
